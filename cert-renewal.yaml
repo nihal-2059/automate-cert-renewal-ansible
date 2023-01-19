@@ -1,0 +1,151 @@
+---
+- hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    vault_url: "https://my-vault-example.com:8200"
+  vars_prompt:
+  - name: username
+    prompt: "Your username"
+    private: no
+
+  - name: password
+    prompt: "Please enter your password"
+
+  tasks:
+  #Check if the files are already updated
+  - name: Check the cert contents
+    shell: "ipa-getcert list"
+    register: certs_output
+
+  #Display the output of cert list command
+  - name: Display the cert contents
+    debug:
+      msg: "{{ certs_output.stdout_lines }}"
+
+  #User will confirm if the files are updated or not
+  - name: Take input from User
+    pause:
+      prompt: "Are the cert's valid...? Press 'y' for yes and 'n' for no"
+    register: user_response 
+ 
+  #If files are not updated, first check the certmonger service
+  - name: Check if the Certmonger service is running
+    systemd:
+      name: certmonger
+    register: service_status 
+
+ # If certmonger service is not running, start the service
+  - name: Starting Certmonger service
+    systemd:
+      name: certmonger
+      state: started
+    when: ( service_status.status.ActiveState == "inactive" ) and ( user_response.user_input == "n" )
+    notify:
+    - Pause Play
+
+  #After starting the certmonger service, check the contents of certs directory
+  - name: Check the updated cert
+    shell: "ipa-getcert list"
+    register: updated_certs_output
+    when: ( service_status.status.ActiveState == "inactive" ) and ( user_response.user_input == "n" )
+  
+  #After starting the certmonger service, display the contents of certs directory
+  - name: Display the contents
+    debug:
+      msg: "{{ updated_certs_output }}"
+    when: ( service_status.status.ActiveState == "inactive" ) and ( user_response.user_input == "n" )
+
+  #Check with user if the contents are updated after the service is started.
+  - name: Input needed from User
+    pause:
+      prompt: "Is the file updated or you want to get the certs from IPA..? Type 'g' to get certs or 'n' for no"
+    register: service_down_response
+    when: ( service_status.status.ActiveState == "inactive" ) and ( user_response.user_input == "n" )
+
+  #Certmonger service was already running, still certs not updated.
+  - name: Certmonger service is already running
+    pause:
+      prompt: "Certmonger service is already up and running.. Do you need new certs generated from IPA.. Type 'g' to get certs or 'n' for no" 
+    register: service_up_response
+    when: ( service_status.status.ActiveState == "active" ) and ( user_response.user_input == "n" )
+
+  #Get the certs from IPA.
+  - name: Get certs from IPA
+    shell: "ipa-getcert request -f /etc/pki/CA/certs/{{ inventory_hostname }}.crt -k /etc/pki/CA/private/$(hostname -f).key -r"
+    when: (( service_down_response is not skipped ) and ( service_down_response.user_input == "g" )) or (( service_up_response is not skipped )  and ( service_up_response.user_input == "g" ))
+    ignore_errors: yes
+    register: cert_error
+
+  #Display the error from ipa-getcert
+  - name: Error from get certs command
+    debug: 
+      msg: "{{ cert_error.stdout_lines }}"
+    when: (( service_down_response is not skipped ) and ( service_down_response.user_input == "g" )) or (( service_up_response is not skipped )  and ( service_up_response.user_input == "g" ))
+
+  #Get the transaction ID from above output
+  - name: Please provide the Tracking ID from above output
+    pause:
+      prompt: "Enter the Tracking ID from above output"
+    register: tracking_id
+    when: (( service_down_response is not skipped ) and ( service_down_response.user_input == "g" )) or (( service_up_response is not skipped )  and ( service_up_response.user_input == "g" ))
+
+  #Stop tracking for existing ID
+  - name: Stop the tracking for cert
+    shell: "ipa-getcert stop-tracking -i {{ tracking_id.user_input }}"
+    when: (( service_down_response is not skipped ) and ( service_down_response.user_input == "g" )) or (( service_up_response is not skipped )  and ( service_up_response.user_input == "g" ))
+
+  #Get the new certs from IPA
+  - name: Get certs from IPA
+    shell: "ipa-getcert request -f /etc/pki/CA/certs/{{ inventory_hostname }}.crt -k /etc/pki/CA/private/$(hostname -f).key -r"
+    when: (( service_down_response is not skipped ) and ( service_down_response.user_input == "g" )) or (( service_up_response is not skipped )  and ( service_up_response.user_input == "g" ))
+    
+  
+  #Read the truststore and keystore password from vault
+  - name: Read keystore and truststore password from vault
+    hashivault_read:
+      verify: no
+      url: "{{ vault_url }}"
+      authtype: ldap
+      username: "{{ username }}"
+      password: "{{ password }}"
+      secret: "/secret/somepath/java_keystore_password"
+      key: value
+    register: content
+    delegate_to: localhost
+
+  #Set the variable for password
+  - name: Set the creds
+    set_fact:
+      key_pass: "{{ content.value }}"
+
+  #Create the p12 file 
+  - name: Create the p12 file
+    shell: "openssl pkcs12 -export -password pass:{{ key_pass }} -in /etc/pki/CA/certs/{{ inventory_hostname }}.crt -inkey /etc/pki/CA/private/{{ inventory_hostname }}.key -out /etc/pki/CA/certs/{{ inventory_hostname }}.p12 -name localhost -CAfile /etc/security/serverKeys/all.jks -caname caroot"
+  
+  #Delete the old alias from keystore
+  - name: Remove alias
+    shell: "/usr/java/default/bin/keytool -delete -noprompt -alias localhost --storepass {{ key_pass }} --keystore /etc/security/serverKeys/keystore.jks"
+
+  - name: Create keystore for the certificate
+    java_cert:
+      pkcs12_path: /etc/pki/CA/certs/{{ inventory_hostname }}.p12
+      pkcs12_password: "{{ key_pass }}"
+      pkcs12_alias: "localhost"
+      keystore_path: /etc/security/serverKeys/keystore.jks
+      keystore_pass: "{{ key_pass }}"
+      cert_alias: "localhost"
+      executable: /usr/java/default/bin/keytool
+      state: present
+
+  - name: Copy the keystore
+    copy:
+      src: /etc/security/serverKeys/keystore.jks
+      dest: /etc/security/clientKeys/keystore.jks
+      remote_src: yes
+
+  #Pause the play once the certmonger service has been restarted
+  handlers:
+  - name: Pause Play
+    pause:
+      minutes: 4
